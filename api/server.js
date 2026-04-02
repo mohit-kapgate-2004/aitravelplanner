@@ -204,6 +204,17 @@ const NOMINATIM_MIN_INTERVAL_MS = Number(
   process.env.NOMINATIM_MIN_INTERVAL_MS || 700
 );
 let lastNominatimRequestAt = 0;
+const TRAVEL_MODES_CACHE_TTL_MS = Number(
+  process.env.TRAVEL_MODES_CACHE_TTL_MS || 5 * 60 * 1000
+);
+const TRAVELTIME_APP_ID = process.env.TRAVELTIME_APP_ID || '';
+const TRAVELTIME_API_KEY = process.env.TRAVELTIME_API_KEY || '';
+const GOOGLE_MAPS_API_KEY =
+  process.env.GOOGLE_MAPS_API_KEY ||
+  process.env.GOOGLE_DIRECTIONS_API_KEY ||
+  process.env.GOOGLE_PLACES_API_KEY ||
+  '';
+const travelModesCache = new Map();
 
 const waitOverpassSlot = async () => {
   const now = Date.now();
@@ -268,6 +279,398 @@ const fetchOverpassElements = async (query) => {
   }
 
   throw lastError || new Error('All Overpass endpoints failed');
+};
+
+const getSafeRouteProfile = (profileValue = 'driving') => {
+  const normalized = profileValue?.toString?.() || 'driving';
+  if (['driving', 'walking', 'cycling'].includes(normalized)) {
+    return normalized;
+  }
+  return normalized === 'transit' ? 'driving' : 'driving';
+};
+
+const fetchRouteForPoints = async (points, profile = 'driving') => {
+  const safeProfile = getSafeRouteProfile(profile);
+  const osrmCoords = points
+    .map(([lat, lng]) => `${lng},${lat}`)
+    .join(';');
+  const url = `https://router.project-osrm.org/route/v1/${safeProfile}/${osrmCoords}?overview=full&geometries=geojson&steps=false`;
+  const response = await getWithRetry(
+    url,
+    { validateStatus: () => true },
+    1
+  );
+
+  if (response.status < 200 || response.status >= 300) {
+    const approx = buildApproxRoute(points, safeProfile);
+    return {
+      route: approx.route,
+      summary: approx.summary,
+      fallback: true,
+      profile: safeProfile,
+      warning: `Live routing unavailable (${response.status}). Showing approximate route.`,
+    };
+  }
+
+  const routeData = response.data?.routes?.[0] || null;
+  const route = routeData?.geometry || null;
+  const summary = routeData
+    ? {
+        distance: routeData.distance || 0,
+        duration: routeData.duration || 0,
+        legs: (routeData.legs || []).map((leg) => ({
+          distance: leg.distance || 0,
+          duration: leg.duration || 0,
+        })),
+      }
+    : null;
+
+  if (!route) {
+    const approx = buildApproxRoute(points, safeProfile);
+    return {
+      route: approx.route,
+      summary: approx.summary,
+      fallback: true,
+      profile: safeProfile,
+      warning: 'Live routing was unavailable. Showing approximate route.',
+    };
+  }
+
+  return {
+    route,
+    summary,
+    fallback: false,
+    profile: safeProfile,
+  };
+};
+
+const roundCoord = (value) => Math.round(Number(value) * 1000) / 1000;
+
+const getTravelModesCacheKey = (origin, destination) =>
+  `${roundCoord(origin.lat)},${roundCoord(origin.lng)}:${roundCoord(
+    destination.lat
+  )},${roundCoord(destination.lng)}`;
+
+const googleModeMeta = {
+  driving: { label: 'Car' },
+  transit: { label: 'Transit' },
+  bicycling: { label: 'Bike' },
+  walking: { label: 'Walk' },
+};
+const traveltimeModeMeta = {
+  driving: { label: 'Car' },
+  public_transport: { label: 'Transit' },
+  cycling: { label: 'Bike' },
+  walking: { label: 'Walk' },
+};
+
+const buildGoogleDirectionsUrl = (origin, destination, mode) => {
+  const params = new URLSearchParams({
+    origin: `${origin.lat},${origin.lng}`,
+    destination: `${destination.lat},${destination.lng}`,
+    mode,
+    units: 'metric',
+    key: GOOGLE_MAPS_API_KEY,
+  });
+
+  if (mode === 'transit') {
+    params.set('departure_time', 'now');
+  }
+
+  return `https://maps.googleapis.com/maps/api/directions/json?${params.toString()}`;
+};
+
+const fetchGoogleTravelMode = async (origin, destination, mode) => {
+  const url = buildGoogleDirectionsUrl(origin, destination, mode);
+  const response = await getWithRetry(
+    url,
+    { validateStatus: () => true },
+    1
+  );
+
+  if (response.status < 200 || response.status >= 300) {
+    throw new Error(`Google Directions HTTP ${response.status}`);
+  }
+
+  const status = response.data?.status;
+  if (status !== 'OK') {
+    if (status === 'ZERO_RESULTS') {
+      return {
+        id: mode,
+        label: googleModeMeta[mode]?.label || mode,
+        distance: null,
+        duration: null,
+        provider: 'google',
+        available: false,
+        note:
+          mode === 'transit'
+            ? 'No public transit route found for this trip right now.'
+            : 'No route found for this mode.',
+      };
+    }
+
+    throw new Error(
+      `Google Directions ${mode} failed with status ${status || 'UNKNOWN'}`
+    );
+  }
+
+  const route = response.data?.routes?.[0];
+  const leg = route?.legs?.[0];
+  if (!leg) {
+    throw new Error(`Google Directions ${mode} returned no leg data`);
+  }
+
+  const noteParts = [];
+  if (mode === 'transit' && leg.departure_time?.text) {
+    noteParts.push(`Leaves ${leg.departure_time.text}`);
+  }
+  if (mode === 'transit' && leg.arrival_time?.text) {
+    noteParts.push(`arrives ${leg.arrival_time.text}`);
+  }
+
+  return {
+    id: mode,
+    label: googleModeMeta[mode]?.label || mode,
+    distance: Number(leg.distance?.value || 0),
+    duration: Number(leg.duration?.value || 0),
+    provider: 'google',
+    available: true,
+    note: noteParts.join(' • '),
+  };
+};
+
+const extractTravelTimeProperty = (resultItem) =>
+  resultItem?.locations?.[0]?.properties?.[0] || null;
+
+const fetchTravelTimeModes = async (origin, destination) => {
+  const departureTime = new Date().toISOString();
+  const modes = ['driving', 'public_transport', 'cycling', 'walking'];
+
+  const response = await routingAxios.post(
+    'https://api.traveltimeapp.com/v4/routes',
+    {
+      locations: [
+        {
+          id: 'origin',
+          coords: {
+            lat: origin.lat,
+            lng: origin.lng,
+          },
+        },
+        {
+          id: 'destination',
+          coords: {
+            lat: destination.lat,
+            lng: destination.lng,
+          },
+        },
+      ],
+      departure_searches: modes.map((mode) => ({
+        id: mode,
+        departure_location_id: 'origin',
+        arrival_location_ids: ['destination'],
+        departure_time: departureTime,
+        transportation: {
+          type: mode,
+        },
+        properties: ['travel_time', 'distance'],
+      })),
+    },
+    {
+      headers: {
+        Accept: 'application/json',
+        'Content-Type': 'application/json',
+        'X-Application-Id': TRAVELTIME_APP_ID,
+        'X-Api-Key': TRAVELTIME_API_KEY,
+      },
+      validateStatus: () => true,
+    }
+  );
+
+  if (response.status < 200 || response.status >= 300) {
+    throw new Error(`TravelTime HTTP ${response.status}`);
+  }
+
+  const results = Array.isArray(response.data?.results)
+    ? response.data.results
+    : [];
+  const unreachableBySearchId = new Map(
+    (Array.isArray(response.data?.unreachable) ? response.data.unreachable : []).map(
+      (item) => [item?.search_id, item]
+    )
+  );
+
+  return modes.map((mode) => {
+    const resultItem = results.find((item) => item?.search_id === mode);
+    const property = extractTravelTimeProperty(resultItem);
+    const unreachable = unreachableBySearchId.get(mode);
+
+    if (!property) {
+      return {
+        id: mode === 'public_transport' ? 'transit' : mode,
+        label: traveltimeModeMeta[mode]?.label || mode,
+        distance: null,
+        duration: null,
+        provider: 'traveltime',
+        available: false,
+        note:
+          mode === 'public_transport'
+            ? 'No public transport route found right now.'
+            : unreachable
+            ? 'This route is currently unreachable for this mode.'
+            : 'No route found for this mode.',
+      };
+    }
+
+    return {
+      id: mode === 'public_transport' ? 'transit' : mode,
+      label: traveltimeModeMeta[mode]?.label || mode,
+      distance: Number(property.distance || 0),
+      duration: Number(property.travel_time || 0),
+      provider: 'traveltime',
+      available: true,
+      note:
+        mode === 'public_transport'
+          ? 'Live multimodal timing from TravelTime.'
+          : 'Live timing from TravelTime.',
+    };
+  });
+};
+
+const buildFallbackTravelModes = async (origin, destination) => {
+  const points = [
+    [origin.lat, origin.lng],
+    [destination.lat, destination.lng],
+  ];
+  const modes = [
+    { id: 'driving', label: 'Car', profile: 'driving' },
+    { id: 'cycling', label: 'Bike', profile: 'cycling' },
+    { id: 'walking', label: 'Walk', profile: 'walking' },
+  ];
+
+  const settled = await Promise.allSettled(
+    modes.map(async (mode) => {
+      const result = await fetchRouteForPoints(points, mode.profile);
+      return {
+        id: mode.id,
+        label: mode.label,
+        distance: Number(result.summary?.distance || 0),
+        duration: Number(result.summary?.duration || 0),
+        provider: result.fallback ? 'estimated' : 'osrm',
+        available: true,
+        note: result.fallback
+          ? 'Estimated timing from free routing service.'
+          : 'Timing from live routing service.',
+      };
+    })
+  );
+
+  const values = settled
+    .filter((item) => item.status === 'fulfilled')
+    .map((item) => item.value);
+
+  values.splice(1, 0, {
+    id: 'transit',
+    label: 'Transit',
+    distance: null,
+    duration: null,
+    provider: 'unavailable',
+    available: false,
+    note:
+      TRAVELTIME_APP_ID && TRAVELTIME_API_KEY
+        ? 'Transit timing is temporarily unavailable.'
+        : GOOGLE_MAPS_API_KEY
+        ? 'Transit timing is temporarily unavailable.'
+        : 'Add TravelTime or Google Maps credentials to show live public transit timings.',
+  });
+
+  return values;
+};
+
+const fetchTravelModes = async (origin, destination) => {
+  const cacheKey = getTravelModesCacheKey(origin, destination);
+  const cached = travelModesCache.get(cacheKey);
+  const now = Date.now();
+
+  if (cached && now - cached.cachedAt < TRAVEL_MODES_CACHE_TTL_MS) {
+    return cached.payload;
+  }
+
+  let payload = null;
+
+  if (TRAVELTIME_APP_ID && TRAVELTIME_API_KEY) {
+    try {
+      payload = {
+        modes: await fetchTravelTimeModes(origin, destination),
+        source: 'traveltime',
+      };
+    } catch (error) {
+      logErrorOncePerWindow(
+        `travel_modes_traveltime_${error?.message || 'error'}`,
+        `TravelTime mode error: ${error?.message || error}`
+      );
+    }
+  }
+
+  if (!payload && GOOGLE_MAPS_API_KEY) {
+    const googleModes = ['driving', 'transit', 'bicycling', 'walking'];
+    const settled = await Promise.allSettled(
+      googleModes.map((mode) => fetchGoogleTravelMode(origin, destination, mode))
+    );
+
+    const googleResults = settled
+      .filter((item) => item.status === 'fulfilled')
+      .map((item) => item.value);
+
+    if (googleResults.length) {
+      const fallbackResults = await buildFallbackTravelModes(origin, destination);
+      const merged = fallbackResults.map((fallbackItem) => {
+        const googleItem = googleResults.find(
+          (item) =>
+            item.id === fallbackItem.id ||
+            (item.id === 'bicycling' && fallbackItem.id === 'cycling')
+        );
+        return (
+          googleItem || {
+            ...fallbackItem,
+            note:
+              fallbackItem.id === 'transit'
+                ? 'Transit timing unavailable from Google right now.'
+                : fallbackItem.note,
+          }
+        );
+      });
+
+      payload = {
+        modes: merged,
+        source: 'google',
+      };
+    } else {
+      logErrorOncePerWindow(
+        'travel_modes_google_empty',
+        'Google travel modes returned no usable routes. Falling back to OSRM estimates.'
+      );
+    }
+
+    settled
+      .filter((item) => item.status === 'rejected')
+      .forEach((item) => {
+        logErrorOncePerWindow(
+          `travel_modes_google_${item.reason?.message || 'error'}`,
+          `Google travel mode error: ${item.reason?.message || item.reason}`
+        );
+      });
+  }
+
+  if (!payload) {
+    payload = {
+      modes: await buildFallbackTravelModes(origin, destination),
+      source: 'fallback',
+    };
+  }
+
+  travelModesCache.set(cacheKey, { payload, cachedAt: now });
+  return payload;
 };
 
 // MongoDB Connection with Mongoose
@@ -403,9 +806,10 @@ app.get('/api/weather', async (req, res) => {
 // Route (OSRM, free)
 app.get('/api/route', async (req, res) => {
   let points = [];
-  let safeProfile = 'driving';
+  let requestedProfile = 'driving';
   try {
     const { coords, profile = 'driving' } = req.query;
+    requestedProfile = profile;
     if (!coords) {
       return res.status(400).json({ error: 'coords is required' });
     }
@@ -416,55 +820,18 @@ app.get('/api/route', async (req, res) => {
     if (points.length < 2 || points.some((p) => p.length !== 2 || p.some(Number.isNaN))) {
       return res.status(400).json({ error: 'coords must be lat,lng pairs' });
     }
-
-    const osrmCoords = points
-      .map(([lat, lng]) => `${lng},${lat}`)
-      .join(';');
-    const profileValue = profile?.toString() || 'driving';
-    safeProfile = ['driving', 'walking', 'cycling'].includes(profileValue)
-      ? profileValue
-      : profileValue === 'transit'
-      ? 'driving'
-      : 'driving';
-    const url = `https://router.project-osrm.org/route/v1/${safeProfile}/${osrmCoords}?overview=full&geometries=geojson&steps=false`;
-    const response = await getWithRetry(
-      url,
-      { validateStatus: () => true },
-      1
-    );
-    if (response.status < 200 || response.status >= 300) {
-      const approx = buildApproxRoute(points, safeProfile);
-      return res.status(200).json({
-        route: approx.route,
-        summary: approx.summary,
-        fallback: true,
-        warning: `Live routing unavailable (${response.status}). Showing approximate route.`,
-      });
-    }
-    const routeData = response.data?.routes?.[0] || null;
-    const route = routeData?.geometry || null;
-    const summary = routeData
-      ? {
-          distance: routeData.distance || 0,
-          duration: routeData.duration || 0,
-          legs: (routeData.legs || []).map((leg) => ({
-            distance: leg.distance || 0,
-            duration: leg.duration || 0,
-          })),
-        }
-      : null;
-    if (!route) {
-      const approx = buildApproxRoute(points, safeProfile);
-      return res.status(200).json({
-        route: approx.route,
-        summary: approx.summary,
-        fallback: true,
-        warning: 'Live routing was unavailable. Showing approximate route.',
-      });
-    }
-    res.status(200).json({ route, summary, fallback: false });
+    const result = await fetchRouteForPoints(points, profile);
+    res.status(200).json({
+      route: result.route,
+      summary: result.summary,
+      fallback: result.fallback,
+      warning: result.warning,
+    });
   } catch (error) {
-    const approx = points.length >= 2 ? buildApproxRoute(points, safeProfile) : null;
+    const approx =
+      points.length >= 2
+        ? buildApproxRoute(points, getSafeRouteProfile(requestedProfile))
+        : null;
     if (approx) {
       return res.status(200).json({
         route: approx.route,
@@ -478,6 +845,40 @@ app.get('/api/route', async (req, res) => {
       error?.code || error?.message || error
     );
     res.status(500).json({ error: 'Failed to fetch route' });
+  }
+});
+
+app.get('/api/travel-modes', async (req, res) => {
+  try {
+    const { originLat, originLng, destLat, destLng } = req.query;
+    const origin = {
+      lat: Number(originLat),
+      lng: Number(originLng),
+    };
+    const destination = {
+      lat: Number(destLat),
+      lng: Number(destLng),
+    };
+
+    if (
+      !Number.isFinite(origin.lat) ||
+      !Number.isFinite(origin.lng) ||
+      !Number.isFinite(destination.lat) ||
+      !Number.isFinite(destination.lng)
+    ) {
+      return res.status(400).json({
+        error: 'originLat, originLng, destLat and destLng are required',
+      });
+    }
+
+    const payload = await fetchTravelModes(origin, destination);
+    res.status(200).json(payload);
+  } catch (error) {
+    console.error(
+      'Error fetching travel modes:',
+      error?.message || error?.code || error
+    );
+    res.status(500).json({ error: 'Failed to fetch travel modes' });
   }
 });
 
