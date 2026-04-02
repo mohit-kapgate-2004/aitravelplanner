@@ -21,7 +21,10 @@ import aiRoutes from "./routes/ai.js";
 // Middleware
 app.use(
   cors({
-    origin: "http://localhost:8081",
+    origin: [
+      "http://localhost:8081",
+      "https://aitravelplanner-jade.vercel.app",
+    ],
     credentials: true,
   })
 );
