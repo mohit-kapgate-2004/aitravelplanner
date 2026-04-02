@@ -19,12 +19,23 @@ import aiRoutes from "./routes/ai.js";
 
 
 // Middleware
+const corsOrigins = (process.env.CORS_ORIGINS ||
+  "http://localhost:8081,https://aitravelplanner-jade.vercel.app")
+  .split(",")
+  .map((origin) => origin.trim())
+  .filter(Boolean);
+
 app.use(
   cors({
-    origin: [
-      "http://localhost:8081",
-      "https://aitravelplanner-jade.vercel.app",
-    ],
+    origin: (origin, callback) => {
+      if (!origin) {
+        return callback(null, true);
+      }
+      if (corsOrigins.includes(origin)) {
+        return callback(null, true);
+      }
+      return callback(new Error("Not allowed by CORS"));
+    },
     credentials: true,
   })
 );
