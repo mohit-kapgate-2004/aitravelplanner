@@ -1040,6 +1040,12 @@ router.post("/chat", async (req, res) => {
     if (!message) {
       return res.status(400).json({ error: "Message is required" });
     }
+    if (!process.env.GROQ_API_KEY) {
+      return res.status(400).json({
+        error:
+          "GROQ_API_KEY is missing on the server. Add it in your backend environment variables.",
+      });
+    }
 
     /* ======================================================
        PHASE 3 - MODIFY EXISTING TRIP

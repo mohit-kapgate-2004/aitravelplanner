@@ -25,17 +25,17 @@ const corsOrigins = (process.env.CORS_ORIGINS ||
   .map((origin) => origin.trim())
   .filter(Boolean);
 
+const isAllowedOrigin = (origin) => {
+  if (!origin) return true;
+  if (corsOrigins.includes(origin)) return true;
+  if (/^https?:\/\/.*\.vercel\.app$/i.test(origin)) return true;
+  if (/^https?:\/\/localhost:\d+$/i.test(origin)) return true;
+  return false;
+};
+
 app.use(
   cors({
-    origin: (origin, callback) => {
-      if (!origin) {
-        return callback(null, true);
-      }
-      if (corsOrigins.includes(origin)) {
-        return callback(null, true);
-      }
-      return callback(new Error("Not allowed by CORS"));
-    },
+    origin: (origin, callback) => callback(null, isAllowedOrigin(origin)),
     credentials: true,
   })
 );
@@ -921,8 +921,11 @@ app.get('/api/weather', async (req, res) => {
       current: response.data?.current || null,
     });
   } catch (error) {
-    console.error('Error fetching weather:', error);
-    res.status(500).json({ error: 'Failed to fetch weather' });
+    console.error('Error fetching weather:', error?.message || error);
+    res.status(200).json({
+      current: null,
+      warning: 'Weather provider unavailable. Showing no data.',
+    });
   }
 });
 
