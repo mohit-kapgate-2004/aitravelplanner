@@ -796,6 +796,58 @@ async function buildActivitiesFromPlaces(places = [], cityHint = "", destination
   return tasks.filter(Boolean);
 }
 
+function buildFallbackActivities(places = [], cityHint = "", destinationContext = null) {
+  if (!destinationContext?.center) return [];
+  const baseLat = Number(destinationContext.center.lat);
+  const baseLng = Number(destinationContext.center.lng);
+  if (!Number.isFinite(baseLat) || !Number.isFinite(baseLng)) return [];
+
+  const label = cityHint || destinationContext.cityHint || "the destination";
+  const safePlaces =
+    places.length > 0
+      ? places
+      : [
+          {
+            name: `${label} City Center`,
+            briefDescription: `Start with the main highlights in ${label}.`,
+          },
+          {
+            name: `${label} Local Market`,
+            briefDescription: `Explore local food and shopping spots in ${label}.`,
+          },
+          {
+            name: `${label} Scenic Point`,
+            briefDescription: `Visit a popular scenic viewpoint in ${label}.`,
+          },
+        ];
+
+  return safePlaces.map((place, index) => {
+    const name = place?.name || `${label} Highlight`;
+    const offsetLat = (index % 3) * 0.008;
+    const offsetLng = ((index + 1) % 3) * 0.008;
+    const lat = baseLat + offsetLat;
+    const lng = baseLng + offsetLng;
+    return {
+      name,
+      briefDescription:
+        place?.briefDescription || `Popular spot in ${label}.`,
+      formatted_address: destinationContext.cityHint || label,
+      estimatedDurationMinutes: estimateVisitDurationMinutes(
+        name,
+        place?.briefDescription || ""
+      ),
+      photos: [getPlaceImage(name, label)],
+      geometry: {
+        location: { lat, lng },
+        viewport: {
+          northeast: { lat: lat + 0.01, lng: lng + 0.01 },
+          southwest: { lat: lat - 0.01, lng: lng - 0.01 },
+        },
+      },
+    };
+  });
+}
+
 async function fetchNearbyAttractions(destinationContext, existingNames = [], needed = 0) {
   if (!destinationContext?.center || needed <= 0) return [];
 
@@ -1009,7 +1061,17 @@ ${
     AI_TIMEOUT_MS
   );
 
-  const extraData = await extraRes.json();
+  if (!extraRes.ok) {
+    console.error("Groq extra places error:", extraRes.status);
+    return [];
+  }
+  let extraData = null;
+  try {
+    extraData = await extraRes.json();
+  } catch (err) {
+    console.error("Groq extra places JSON parse failed");
+    return [];
+  }
   const extraContent = extraData?.choices?.[0]?.message?.content || "";
   const raw = extraContent
     .replace(/```json/g, "")
@@ -1185,7 +1247,21 @@ ${
         }
       );
 
-      const modifyData = await modifyRes.json();
+      if (!modifyRes.ok) {
+        console.error("Groq modify error:", modifyRes.status);
+        return res.status(200).json({
+          reply: "AI service is temporarily unavailable. Please try again soon.",
+        });
+      }
+      let modifyData = null;
+      try {
+        modifyData = await modifyRes.json();
+      } catch (err) {
+        console.error("Groq modify JSON parse failed");
+        return res.status(200).json({
+          reply: "AI service is temporarily unavailable. Please try again soon.",
+        });
+      }
       const modifyContent = modifyData?.choices?.[0]?.message?.content || "";
 
       let raw = modifyContent
@@ -1279,9 +1355,18 @@ ${
 
       geoActivities = geoActivities.slice(0, maxPlaces);
       if (geoActivities.length === 0) {
-        return res.status(500).json({
-          error: "Could not build a local itinerary for this destination. Please try a clearer destination name.",
-        });
+        const fallbackActivities = buildFallbackActivities(
+          requestedPlaces,
+          cityHint,
+          destinationContext
+        );
+        if (fallbackActivities.length > 0) {
+          geoActivities = fallbackActivities.slice(0, maxPlaces);
+        } else {
+          return res.status(500).json({
+            error: "Could not build a local itinerary for this destination. Please try a clearer destination name.",
+          });
+        }
       }
 
       const newItinerary = scheduleActivitiesByTime(
@@ -1451,7 +1536,21 @@ ${
         AI_TIMEOUT_MS
       );
 
-      const aiData = await aiRes.json();
+      if (!aiRes.ok) {
+        console.error("Groq create error:", aiRes.status);
+        return res.status(200).json({
+          reply: "AI service is temporarily unavailable. Please try again soon.",
+        });
+      }
+      let aiData = null;
+      try {
+        aiData = await aiRes.json();
+      } catch (err) {
+        console.error("Groq create JSON parse failed");
+        return res.status(200).json({
+          reply: "AI service is temporarily unavailable. Please try again soon.",
+        });
+      }
       aiContent = aiData?.choices?.[0]?.message?.content || "";
       let raw = aiContent
         .replace(/```json/g, "")
@@ -1587,9 +1686,18 @@ ${
 
     geoActivities = geoActivities.slice(0, maxPlaces);
     if (geoActivities.length === 0) {
-      return res.status(500).json({
-        error: "Could not build a local itinerary for this destination. Try a more specific city/region.",
-      });
+      const fallbackActivities = buildFallbackActivities(
+        requestedPlaces,
+        planningCity,
+        destinationContext
+      );
+      if (fallbackActivities.length > 0) {
+        geoActivities = fallbackActivities.slice(0, maxPlaces);
+      } else {
+        return res.status(500).json({
+          error: "Could not build a local itinerary for this destination. Try a more specific city/region.",
+        });
+      }
     }
 
     const scheduled = scheduleActivitiesByTime(geoActivities, days, startDate);
