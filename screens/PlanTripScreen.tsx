@@ -8,6 +8,7 @@ import {
   TextInput,
   ActivityIndicator,
   Platform,
+  Linking,
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { Ionicons, MaterialIcons } from "@expo/vector-icons";
@@ -26,6 +27,7 @@ import { useAuth, useUser } from "@clerk/clerk-expo";
 import axios from "axios";
 import * as Location from "expo-location";
 import { API_BASE_URL } from "../config/api";
+import { safeGoBack } from "../utils/navigation";
 
 dayjs.extend(customParseFormat);
 
@@ -67,7 +69,13 @@ const getPlaceImageCandidates = (place: any, tripName = "travel") => {
 };
 
 const formatDurationShort = (seconds?: number) => {
-  if (!Number.isFinite(Number(seconds))) return "N/A";
+  if (
+    seconds === null ||
+    seconds === undefined ||
+    !Number.isFinite(Number(seconds))
+  ) {
+    return "N/A";
+  }
   const value = Number(seconds || 0);
   const hrs = Math.floor(value / 3600);
   const mins = Math.round((value % 3600) / 60);
@@ -75,8 +83,76 @@ const formatDurationShort = (seconds?: number) => {
 };
 
 const formatDistanceShort = (meters?: number) => {
-  if (!Number.isFinite(Number(meters))) return "N/A";
+  if (
+    meters === null ||
+    meters === undefined ||
+    !Number.isFinite(Number(meters))
+  ) {
+    return "N/A";
+  }
   return `${(Number(meters || 0) / 1000).toFixed(1)} km`;
+};
+
+const formatDurationCompact = (seconds?: number) => {
+  if (
+    seconds === null ||
+    seconds === undefined ||
+    !Number.isFinite(Number(seconds))
+  ) {
+    return "--";
+  }
+  const value = Number(seconds || 0);
+  const days = Math.floor(value / 86400);
+  if (days >= 1) return `${days}d`;
+  const hrs = Math.floor(value / 3600);
+  const mins = Math.round((value % 3600) / 60);
+  if (hrs > 0) return `${hrs}h`;
+  return `${Math.max(1, mins)}m`;
+};
+
+const haversineKm = (
+  a: { latitude: number; longitude: number },
+  b: { latitude: number; longitude: number }
+) => {
+  const R = 6371;
+  const toRad = (value: number) => (value * Math.PI) / 180;
+  const dLat = toRad(b.latitude - a.latitude);
+  const dLon = toRad(b.longitude - a.longitude);
+  const lat1 = toRad(a.latitude);
+  const lat2 = toRad(b.latitude);
+  const h =
+    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+    Math.sin(dLon / 2) *
+      Math.sin(dLon / 2) *
+      Math.cos(lat1) *
+      Math.cos(lat2);
+  const c = 2 * Math.atan2(Math.sqrt(h), Math.sqrt(1 - h));
+  return R * c;
+};
+
+const getPriceTier = (perPersonPerDay: number) => {
+  if (!Number.isFinite(perPersonPerDay) || perPersonPerDay <= 0) {
+    return { label: "Mid-range", tag: "Mid-range", hint: "Flexible pricing." };
+  }
+  if (perPersonPerDay <= 1200) {
+    return {
+      label: "Budget",
+      tag: "Budget",
+      hint: "Affordable options near the destination.",
+    };
+  }
+  if (perPersonPerDay <= 3500) {
+    return {
+      label: "Mid-range",
+      tag: "Mid-range",
+      hint: "Balanced comfort and cost.",
+    };
+  }
+  return {
+    label: "Premium",
+    tag: "Premium",
+    hint: "Higher comfort and amenities.",
+  };
 };
 
 const buildNearbyPlaceData = (
@@ -207,6 +283,8 @@ const PlanTripScreen = () => {
   const [weatherLoading, setWeatherLoading] = useState(false);
   const [overviewHotels, setOverviewHotels] = useState<any[]>([]);
   const [overviewTransport, setOverviewTransport] = useState<any[]>([]);
+  const [overviewRestaurants, setOverviewRestaurants] = useState<any[]>([]);
+  const [hotelSlideIndex, setHotelSlideIndex] = useState(0);
   const [overviewNearbyLoading, setOverviewNearbyLoading] = useState(false);
   const [exploreAttractions, setExploreAttractions] = useState<any[]>([]);
   const [exploreRestaurants, setExploreRestaurants] = useState<any[]>([]);
@@ -215,7 +293,15 @@ const PlanTripScreen = () => {
   const [exploreLoadedKey, setExploreLoadedKey] = useState<string | null>(null);
   const [reachLoading, setReachLoading] = useState(false);
   const [reachEstimates, setReachEstimates] = useState<
-    { id: string; label: string; distance: number; duration: number }[]
+    {
+      id: string;
+      label: string;
+      distance: number | null;
+      duration: number | null;
+      provider?: string;
+      note?: string;
+      available?: boolean;
+    }[]
   >([]);
   const [userLocation, setUserLocation] = useState<{
     latitude: number;
@@ -259,18 +345,121 @@ const PlanTripScreen = () => {
     return dayjs(trip.endDate).diff(dayjs(trip.startDate), "day") + 1;
   }, [trip?.startDate, trip?.endDate]);
 
+  const travelersCount = useMemo(() => {
+    const manualCount = Number(trip?.manualPreferences?.travelersCount || 0);
+    if (manualCount > 0) return manualCount;
+    const travelerList = Array.isArray(trip?.travelers) ? trip.travelers.length : 0;
+    return travelerList > 0 ? travelerList : 1;
+  }, [trip]);
+
+  const budgetPerPersonPerDay = useMemo(() => {
+    if (!Number.isFinite(Number(trip?.budget)) || totalTripDays <= 0) return 0;
+    return Number(trip?.budget || 0) / Math.max(1, totalTripDays) / Math.max(1, travelersCount);
+  }, [trip?.budget, totalTripDays, travelersCount]);
+
+  const minimumBudget = useMemo(() => {
+    const MIN_PER_PERSON_PER_DAY = 1200;
+    return Math.max(0, MIN_PER_PERSON_PER_DAY * Math.max(1, totalTripDays) * Math.max(1, travelersCount));
+  }, [totalTripDays, travelersCount]);
+
+  const budgetTier = useMemo(
+    () => getPriceTier(budgetPerPersonPerDay),
+    [budgetPerPersonPerDay]
+  );
+
+  const fallbackTravelModes = useMemo(
+    () => [
+      { id: "driving", label: "Car", distance: null, duration: null },
+      { id: "transit", label: "Transit", distance: null, duration: null },
+      { id: "cycling", label: "Bike", distance: null, duration: null },
+      { id: "walking", label: "Walk", distance: null, duration: null },
+    ],
+    []
+  );
+
+  const HOTEL_CARD_WIDTH = 256;
+  const HOTEL_CARD_GAP = 12;
+
+  const handleHotelScroll = useCallback(
+    (event: any) => {
+      if (!overviewHotels.length) return;
+      const x = event?.nativeEvent?.contentOffset?.x || 0;
+      const index = Math.round(x / (HOTEL_CARD_WIDTH + HOTEL_CARD_GAP));
+      const safeIndex = Math.max(0, Math.min(index, overviewHotels.length - 1));
+      setHotelSlideIndex(safeIndex);
+    },
+    [overviewHotels.length]
+  );
+
+  const bestTravelModeId = useMemo(() => {
+    const candidates = reachEstimates.filter(
+      (item) => Number.isFinite(Number(item.duration || 0)) && (item.duration || 0) > 0
+    );
+    if (!candidates.length) return null;
+    return candidates.reduce((best, item) =>
+      (item.duration || 0) < (best.duration || 0) ? item : best
+    ).id;
+  }, [reachEstimates]);
+
+  const buildAiPrompt = useCallback(() => {
+    const days = totalTripDays || 3;
+    const tripLabel = formatTripName(trip?.tripName || "your trip");
+    const prefs = trip?.manualPreferences || {};
+    const travelMode = trip?.preferences?.travelMode || "driving";
+    const startFrom =
+      trip?.preferences?.startFromCurrentLocation === false
+        ? "first stop"
+        : "current location";
+
+    const lines = [
+      `Create a detailed ${prefs.tripType ? prefs.tripType.toLowerCase() : ""} itinerary for ${tripLabel}.`,
+      `Trip length: ${days} days. Provide 3 to 5 places per day.`,
+      `Travel mode: ${travelMode}. Start from ${startFrom}.`,
+      `Budget: INR ${trip?.budget || 0}.`,
+    ];
+
+    if (prefs.travelersCount) {
+      lines.push(`Group size: ${prefs.travelersCount} travelers.`);
+    }
+    if (prefs.accommodationType) {
+      lines.push(`Stay style: ${prefs.accommodationType}.`);
+    }
+    if (Array.isArray(prefs.activityInterests) && prefs.activityInterests.length) {
+      lines.push(`Activities: ${prefs.activityInterests.join(", ")}.`);
+    }
+
+    lines.push("Keep places inside the destination region and avoid far away cities.");
+    return lines.filter(Boolean).join(" ");
+  }, [totalTripDays, trip, formatTripName]);
+
   const defaultItineraryDate = useMemo(
     () => trip?.itinerary?.[0]?.date || trip?.startDate || dayjs().format("YYYY-MM-DD"),
     [trip]
   );
 
   const backToPrevious = useCallback(() => {
-    if (navAny?.canGoBack?.()) {
-      navAny.goBack();
-      return;
-    }
-    navAny?.navigate?.("HomeMain");
+    safeGoBack(navAny);
   }, [navAny]);
+
+  const openDirections = useCallback(
+    (place: any) => {
+      const lat = place?.lat ?? place?.geometry?.location?.lat;
+      const lng = place?.lng ?? place?.geometry?.location?.lng;
+      if (!Number.isFinite(Number(lat)) || !Number.isFinite(Number(lng))) {
+        return;
+      }
+      const destination = `${lat},${lng}`;
+      const url = `https://www.google.com/maps/dir/?api=1&destination=${encodeURIComponent(
+        destination
+      )}`;
+      if (Platform.OS === "web") {
+        window.open(url, "_blank");
+        return;
+      }
+      Linking.openURL(url);
+    },
+    []
+  );
 
   const formatWeather = (code?: number) => {
     const table: Record<number, string> = {
@@ -363,7 +552,7 @@ const PlanTripScreen = () => {
     if (!location) return;
     try {
       setOverviewNearbyLoading(true);
-      const [hotelsRes, transportRes] = await Promise.all([
+      const [hotelsRes, transportRes, restaurantsRes] = await Promise.all([
         axios.get(`${API_BASE_URL}/api/places/nearby`, {
           params: {
             lat: location.lat,
@@ -380,12 +569,22 @@ const PlanTripScreen = () => {
             radius: 9000,
           },
         }),
+        axios.get(`${API_BASE_URL}/api/places/nearby`, {
+          params: {
+            lat: location.lat,
+            lng: location.lng,
+            type: "restaurant",
+            radius: 7000,
+          },
+        }),
       ]);
       setOverviewHotels((hotelsRes.data?.places || []).slice(0, 5));
       setOverviewTransport((transportRes.data?.places || []).slice(0, 5));
+      setOverviewRestaurants((restaurantsRes.data?.places || []).slice(0, 5));
     } catch (err) {
       setOverviewHotels([]);
       setOverviewTransport([]);
+      setOverviewRestaurants([]);
     } finally {
       setOverviewNearbyLoading(false);
     }
@@ -454,28 +653,17 @@ const PlanTripScreen = () => {
       setReachEstimates([]);
       return;
     }
-    const coords = `${userLocation.latitude},${userLocation.longitude}|${location.lat},${location.lng}`;
-    const modes = [
-      { id: "driving", label: "Car" },
-      { id: "cycling", label: "Bike" },
-      { id: "walking", label: "Walk" },
-    ];
     try {
       setReachLoading(true);
-      const responses = await Promise.all(
-        modes.map(async (mode) => {
-          const res = await axios.get(`${API_BASE_URL}/api/route`, {
-            params: { coords, profile: mode.id },
-          });
-          return {
-            id: mode.id,
-            label: mode.label,
-            distance: Number(res.data?.summary?.distance || 0),
-            duration: Number(res.data?.summary?.duration || 0),
-          };
-        })
-      );
-      setReachEstimates(responses);
+      const response = await axios.get(`${API_BASE_URL}/api/travel-modes`, {
+        params: {
+          originLat: userLocation.latitude,
+          originLng: userLocation.longitude,
+          destLat: location.lat,
+          destLng: location.lng,
+        },
+      });
+      setReachEstimates(Array.isArray(response.data?.modes) ? response.data.modes : []);
     } catch (err) {
       setReachEstimates([]);
     } finally {
@@ -582,20 +770,22 @@ const PlanTripScreen = () => {
 
       const res = await axios.post(`${API_BASE_URL}/api/ai/chat`, {
         tripId: trip._id,
-        message: `Create a detailed itinerary for ${trip.tripName} with 2 to 4 places per day.`,
+        message: buildAiPrompt(),
       });
 
       const updatedTrip = res.data?.trip || res.data;
       if (updatedTrip?._id) {
         setTrip(updatedTrip);
         setSelectedTab("Itinerary");
+      } else if (res.data?.reply) {
+        setError(res.data.reply);
       }
     } catch (err: any) {
       setError(err.response?.data?.error || "Failed to generate AI itinerary");
     } finally {
       setAiLoading(false);
     }
-  }, [trip?._id, trip?.tripName]);
+  }, [trip?._id, buildAiPrompt]);
 
   useEffect(() => {
     const hasActivities = Array.isArray(trip?.itinerary)
@@ -1213,10 +1403,12 @@ const PlanTripScreen = () => {
       <>
         {/* ================= EXISTING UI (UNCHANGED) ================= */}
 
-        <View className="relative w-full bg-slate-900 pt-4 pb-14">
+        <View className="relative w-full bg-slate-900 pt-4 pb-14" pointerEvents="box-none">
           <TouchableOpacity
             onPress={backToPrevious}
-            className="absolute top-4 left-4 p-2 bg-white rounded-full"
+            className="absolute top-4 left-4 p-2 bg-white rounded-full z-20"
+            hitSlop={{ top: 12, bottom: 12, left: 12, right: 12 }}
+            style={{ zIndex: 20, elevation: 20 }}
           >
             <Ionicons name="arrow-back" size={24} color="#000" />
           </TouchableOpacity>
@@ -1359,6 +1551,20 @@ const PlanTripScreen = () => {
             </View>
           </View>
 
+          {Number(trip?.budget || 0) > 0 && Number(trip?.budget || 0) < minimumBudget && (
+            <View className="mb-6 bg-amber-50 rounded-lg p-4 border border-amber-200">
+              <Text className="text-base font-semibold text-amber-900 mb-1">
+                Budget may be too low for this trip
+              </Text>
+              <Text className="text-sm text-amber-800">
+                For {totalTripDays} days and {travelersCount} traveler(s), a
+                practical minimum is around INR {Math.round(minimumBudget)}.
+                Consider increasing the budget so we can recommend stays,
+                meals, and transport that fit comfortably.
+              </Text>
+            </View>
+          )}
+
           <View className="mb-6 bg-white rounded-lg p-4 border border-gray-200">
             <View className="flex-row items-center justify-between mb-2">
               <Text className="font-semibold text-base text-gray-900">
@@ -1374,22 +1580,90 @@ const PlanTripScreen = () => {
 
             {reachLoading ? (
               <Text className="text-sm text-gray-500">Calculating travel times...</Text>
-            ) : reachEstimates.length > 0 ? (
-              <View className="flex-row flex-wrap">
-                {reachEstimates.map((item) => (
-                  <View
-                    key={item.id}
-                    className="w-[48%] mr-[2%] mb-2 p-3 bg-gray-50 rounded-lg"
-                  >
-                    <Text className="text-sm font-semibold text-gray-900">
-                      {item.label}
-                    </Text>
-                    <Text className="text-xs text-gray-600 mt-1">
-                      {formatDistanceShort(item.distance)} • {formatDurationShort(item.duration)}
-                    </Text>
-                  </View>
-                ))}
-              </View>
+            ) : (reachEstimates.length > 0 || fallbackTravelModes.length > 0) ? (
+              <ScrollView
+                horizontal
+                showsHorizontalScrollIndicator={false}
+                className="flex-row"
+              >
+                {(reachEstimates.length > 0 ? reachEstimates : fallbackTravelModes).map((item) => {
+                  const isBest = item.id === bestTravelModeId;
+                  const iconName =
+                    item.id === "driving"
+                      ? "directions-car"
+                      : item.id === "transit"
+                      ? "directions-transit"
+                      : item.id === "cycling" || item.id === "bicycling"
+                      ? "directions-bike"
+                      : "directions-walk";
+                  const hasEstimate =
+                    Number.isFinite(Number(item.duration || 0)) &&
+                    Number.isFinite(Number(item.distance || 0)) &&
+                    (item.duration || 0) > 0;
+                  return (
+                    <TouchableOpacity
+                      key={item.id}
+                      disabled={!overviewTarget?.geometry?.location}
+                      onPress={() => {
+                        if (!userLocation) {
+                          requestUserLocation();
+                          return;
+                        }
+                        const destination = overviewTarget?.geometry?.location;
+                        if (!destination) return;
+                        const destinationStr = `${destination.lat},${destination.lng}`;
+                        const originStr = `${userLocation.latitude},${userLocation.longitude}`;
+                        const travelMode =
+                          item.id === "transit"
+                            ? "transit"
+                            : item.id === "cycling"
+                            ? "bicycling"
+                            : item.id === "walking"
+                            ? "walking"
+                            : "driving";
+                        const url = `https://www.google.com/maps/dir/?api=1&origin=${encodeURIComponent(
+                          originStr
+                        )}&destination=${encodeURIComponent(
+                          destinationStr
+                        )}&travelmode=${travelMode}`;
+                        if (Platform.OS === "web") {
+                          window.open(url, "_blank");
+                          return;
+                        }
+                        Linking.openURL(url);
+                      }}
+                      className={`mr-3 px-4 py-3 rounded-full border ${
+                        isBest ? "border-amber-400 bg-amber-50" : "border-gray-200 bg-white"
+                      }`}
+                    >
+                      <View className="flex-row items-center">
+                        <MaterialIcons
+                          name={iconName as any}
+                          size={18}
+                          color={isBest ? "#d97706" : "#111827"}
+                        />
+                        <Text className="text-sm font-semibold text-gray-900 ml-2">
+                          {item.label}
+                        </Text>
+                      </View>
+                      <Text className="text-xs text-gray-600 mt-1">
+                        {isBest ? "Best" : " "}
+                      </Text>
+                      <Text className="text-sm font-semibold text-gray-900 mt-1">
+                        {formatDurationCompact(item.duration)}
+                      </Text>
+                      <Text className="text-[11px] text-gray-500 mt-0.5">
+                        {formatDistanceShort(item.distance)}
+                      </Text>
+                      {!hasEstimate && (
+                        <Text className="text-[10px] text-gray-400 mt-0.5">
+                          Enable location for timing
+                        </Text>
+                      )}
+                    </TouchableOpacity>
+                  );
+                })}
+              </ScrollView>
             ) : (
               <Text className="text-sm text-gray-500">
                 {locationDenied
@@ -1401,37 +1675,169 @@ const PlanTripScreen = () => {
 
           <View className="mb-6 bg-white rounded-lg p-4 border border-gray-200">
             <Text className="font-semibold text-base mb-2 text-gray-900">
-              Nearby hotels and transport
+              Nearby stays, food, and transport
+            </Text>
+            <Text className="text-xs text-gray-500 mb-3">
+              Pricing style: {budgetTier.label} • {budgetTier.hint}
             </Text>
             {overviewNearbyLoading ? (
-              <Text className="text-sm text-gray-500">Loading nearby stays and transport...</Text>
+              <Text className="text-sm text-gray-500">
+                Loading nearby stays, food, and transport...
+              </Text>
             ) : (
-              <View className="flex-row justify-between">
-                <View className="w-[48%]">
-                  <Text className="text-sm font-medium text-gray-800 mb-1">Hotels</Text>
-                  {overviewHotels.length > 0 ? (
-                    overviewHotels.map((item, idx) => (
-                      <Text key={`${item.id || item.name}-${idx}`} className="text-xs text-gray-600 mb-1">
-                        • {item.name}
-                      </Text>
-                    ))
-                  ) : (
-                    <Text className="text-xs text-gray-500">No nearby hotels found</Text>
-                  )}
-                </View>
-                <View className="w-[48%]">
-                  <Text className="text-sm font-medium text-gray-800 mb-1">Transport</Text>
-                  {overviewTransport.length > 0 ? (
-                    overviewTransport.map((item, idx) => (
-                      <Text key={`${item.id || item.name}-${idx}`} className="text-xs text-gray-600 mb-1">
-                        • {item.name}
-                      </Text>
-                    ))
-                  ) : (
-                    <Text className="text-xs text-gray-500">No transport hubs found</Text>
-                  )}
-                </View>
-              </View>
+              <>
+                <Text className="text-sm font-medium text-gray-800 mb-2">
+                  Hotels
+                </Text>
+                {overviewHotels.length > 0 ? (
+                  <ScrollView
+                    horizontal
+                    showsHorizontalScrollIndicator={false}
+                    className="flex-row mb-3"
+                    snapToInterval={HOTEL_CARD_WIDTH + HOTEL_CARD_GAP}
+                    decelerationRate="fast"
+                    onScroll={handleHotelScroll}
+                    scrollEventThrottle={16}
+                  >
+                    {overviewHotels.map((item, idx) => {
+                      const origin = overviewTarget?.geometry?.location;
+                      const distance =
+                        origin && Number.isFinite(item.lat) && Number.isFinite(item.lng)
+                          ? haversineKm(
+                              { latitude: origin.lat, longitude: origin.lng },
+                              { latitude: item.lat, longitude: item.lng }
+                            )
+                          : null;
+                      return (
+                        <View
+                          key={`${item.id || item.name}-${idx}`}
+                          className="mr-3 w-64 p-3 rounded-xl bg-gray-50"
+                        >
+                          <View className="flex-row justify-between items-start">
+                            <View className="flex-1 pr-2">
+                              <Text className="text-sm font-semibold text-gray-900">
+                                {item.name}
+                              </Text>
+                              <Text className="text-xs text-gray-500 mt-1">
+                                {item.address || "Address unavailable"}
+                              </Text>
+                            </View>
+                            <Text className="text-[10px] text-gray-600 bg-white px-2 py-0.5 rounded-full border border-gray-200">
+                              {budgetTier.tag}
+                            </Text>
+                          </View>
+                          <View className="flex-row items-center justify-between mt-2">
+                            <Text className="text-xs text-gray-500">
+                              {distance ? `${distance.toFixed(1)} km away` : "Nearby"}
+                            </Text>
+                            <TouchableOpacity
+                              onPress={() => openDirections(item)}
+                              className="px-3 py-1 rounded-full bg-white border border-gray-200"
+                            >
+                              <Text className="text-xs text-blue-600 font-semibold">
+                                Directions
+                              </Text>
+                            </TouchableOpacity>
+                          </View>
+                        </View>
+                      );
+                    })}
+                  </ScrollView>
+                ) : (
+                  <Text className="text-xs text-gray-500 mb-3">
+                    No nearby hotels found
+                  </Text>
+                )}
+                {overviewHotels.length > 1 && (
+                  <View className="flex-row justify-center mb-4">
+                    {overviewHotels.map((_, idx) => (
+                      <View
+                        key={`hotel-dot-${idx}`}
+                        className={`w-2 h-2 rounded-full mx-1 ${
+                          idx === hotelSlideIndex ? "bg-gray-900" : "bg-gray-300"
+                        }`}
+                      />
+                    ))}
+                  </View>
+                )}
+
+                <Text className="text-sm font-medium text-gray-800 mt-2 mb-2">
+                  Restaurants
+                </Text>
+                {overviewRestaurants.length > 0 ? (
+                  <ScrollView
+                    horizontal
+                    showsHorizontalScrollIndicator={false}
+                    className="flex-row mb-3"
+                  >
+                    {overviewRestaurants.map((item, idx) => {
+                      const origin = overviewTarget?.geometry?.location;
+                      const distance =
+                        origin && Number.isFinite(item.lat) && Number.isFinite(item.lng)
+                          ? haversineKm(
+                              { latitude: origin.lat, longitude: origin.lng },
+                              { latitude: item.lat, longitude: item.lng }
+                            )
+                          : null;
+                      return (
+                        <View
+                          key={`${item.id || item.name}-${idx}`}
+                          className="mr-3 w-64 p-3 rounded-xl bg-gray-50"
+                        >
+                          <View className="flex-row justify-between items-start">
+                            <View className="flex-1 pr-2">
+                              <Text className="text-sm font-semibold text-gray-900">
+                                {item.name}
+                              </Text>
+                              <Text className="text-xs text-gray-500 mt-1">
+                                {item.address || "Address unavailable"}
+                              </Text>
+                            </View>
+                            <Text className="text-[10px] text-gray-600 bg-white px-2 py-0.5 rounded-full border border-gray-200">
+                              {budgetTier.tag}
+                            </Text>
+                          </View>
+                          <View className="flex-row items-center justify-between mt-2">
+                            <Text className="text-xs text-gray-500">
+                              {distance ? `${distance.toFixed(1)} km away` : "Nearby"}
+                            </Text>
+                            <TouchableOpacity
+                              onPress={() => openDirections(item)}
+                              className="px-3 py-1 rounded-full bg-white border border-gray-200"
+                            >
+                              <Text className="text-xs text-blue-600 font-semibold">
+                                Directions
+                              </Text>
+                            </TouchableOpacity>
+                          </View>
+                        </View>
+                      );
+                    })}
+                  </ScrollView>
+                ) : (
+                  <Text className="text-xs text-gray-500 mb-3">
+                    No nearby restaurants found
+                  </Text>
+                )}
+
+                <Text className="text-sm font-medium text-gray-800 mt-2 mb-1">
+                  Transport hubs
+                </Text>
+                {overviewTransport.length > 0 ? (
+                  overviewTransport.map((item, idx) => (
+                    <Text
+                      key={`${item.id || item.name}-${idx}`}
+                      className="text-xs text-gray-600 mb-1"
+                    >
+                      • {item.name}
+                    </Text>
+                  ))
+                ) : (
+                  <Text className="text-xs text-gray-500">
+                    No transport hubs found
+                  </Text>
+                )}
+              </>
             )}
           </View>
 

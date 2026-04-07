@@ -6,6 +6,7 @@ import dayjs from "dayjs";
 import axios from "axios";
 import { Ionicons } from "@expo/vector-icons";
 import { API_BASE_URL } from "../config/api";
+import { safeGoBack } from "../utils/navigation";
 
 type Activity = {
   _id?: string;
@@ -208,11 +209,7 @@ const MapScreen = () => {
   const lastSmartStopsKeyRef = useRef("");
 
   const goBackSafe = () => {
-    if (navigation?.canGoBack?.()) {
-      navigation.goBack();
-      return;
-    }
-    navigation.navigate("HomeMain");
+    safeGoBack(navigation);
   };
 
   const itineraryDays = useMemo(

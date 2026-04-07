@@ -11,6 +11,7 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 import { RouteProp } from '@react-navigation/native';
 import { Ionicons } from '@expo/vector-icons';
 import type { GuideStackParamList } from '../navigation/GuideStack';
+import { safeGoBack } from '../utils/navigation';
 
 type GuideDetailScreenRouteProp = RouteProp<GuideStackParamList, 'GuideDetail'>;
 
@@ -84,11 +85,7 @@ const GuideDetailScreen = ({ route, navigation }: Props) => {
   const itinerary = itineraries[place.name] || [];
   const extraAttributes = additionalAttributes[place.name] || { entryFee: 'N/A', travelTips: [] };
   const goBackSafe = () => {
-    if (navigation?.canGoBack?.()) {
-      navigation.goBack();
-      return;
-    }
-    navigation.navigate('GuideMain');
+    safeGoBack(navigation);
   };
 
   return (

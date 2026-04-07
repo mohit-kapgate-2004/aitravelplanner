@@ -20,6 +20,7 @@ import dayjs from "dayjs";
 import axios from "axios";
 import * as Location from "expo-location";
 import { API_BASE_URL } from "../config/api";
+import { safeGoBack } from "../utils/navigation";
 
 const { width } = Dimensions.get("window");
 const CARD_WIDTH = width * 0.8;
@@ -233,11 +234,7 @@ const MapScreen = () => {
   const flatListRef = useRef<FlatList>(null);
 
   const goBackSafe = () => {
-    if (navigation?.canGoBack?.()) {
-      navigation.goBack();
-      return;
-    }
-    navigation.navigate("HomeMain");
+    safeGoBack(navigation);
   };
 
   const itineraryDays = useMemo(

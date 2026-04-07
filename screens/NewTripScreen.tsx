@@ -18,6 +18,7 @@ import { useNavigation } from "@react-navigation/native";
 import { useAuth, useUser } from "@clerk/clerk-expo";
 import axios from "axios";
 import { API_BASE_URL } from "../config/api";
+import { safeGoBack } from "../utils/navigation";
 
 type PlaceSuggestion = {
   display_name: string;
@@ -40,8 +41,6 @@ const STAY_OPTIONS = [
   { id: "mid-range", label: "Mid-range" },
   { id: "premium", label: "Premium" },
 ];
-
-const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 const NewTripScreen = () => {
   const navigation = useNavigation<any>();
@@ -76,11 +75,7 @@ const NewTripScreen = () => {
   const [error, setError] = useState<string | null>(null);
 
   const goBackSafe = () => {
-    if (navigation?.canGoBack?.()) {
-      navigation.goBack();
-      return;
-    }
-    navigation.navigate("HomeMain");
+    safeGoBack(navigation);
   };
 
   const today = dayjs().format("YYYY-MM-DD");
@@ -242,64 +237,6 @@ const NewTripScreen = () => {
       activities: [],
     }));
 
-  const buildManualPrompt = ({
-    destination,
-    dayCount,
-    budget,
-    travelerCount,
-    type,
-    stayType,
-  }: {
-    destination: string;
-    dayCount: number;
-    budget: number;
-    travelerCount: number;
-    type: string;
-    stayType: string;
-  }) =>
-    [
-      `Plan a ${dayCount} day ${type.toLowerCase()} trip in ${destination}.`,
-      `Keep total budget under ${budget} INR.`,
-      `Group size is ${travelerCount} friends.`,
-      `Preferred stay style: ${stayType}.`,
-      `Return a practical itinerary with 3 to 5 places each day, realistic travel flow, and all places only in or near ${destination}.`,
-    ].join(" ");
-
-  const generateManualTripDetails = async ({
-    tripId,
-    prompt,
-    clerkUserId,
-    email,
-  }: {
-    tripId: string;
-    prompt: string;
-    clerkUserId: string;
-    email: string;
-  }) => {
-    for (let attempt = 0; attempt < 2; attempt++) {
-      try {
-        const res = await axios.post(`${API_BASE_URL}/api/ai/chat`, {
-          tripId,
-          message: prompt,
-          clerkUserId,
-          userData: {
-            email,
-            name: user?.fullName || "",
-          },
-        });
-        const updatedTrip = res.data?.trip;
-        if (updatedTrip?._id) {
-          return updatedTrip;
-        }
-      } catch (err) {
-        if (attempt === 0) {
-          await sleep(1200);
-          continue;
-        }
-      }
-    }
-    return null;
-  };
 
   const handleCreateTrip = async () => {
     try {
@@ -374,23 +311,7 @@ const NewTripScreen = () => {
         return;
       }
 
-      const aiPrompt = buildManualPrompt({
-        destination: chosenLocation,
-        dayCount,
-        budget: budgetValue,
-        travelerCount: travelersCount,
-        type: tripType,
-        stayType: accommodationType,
-      });
-
-      const detailedTrip = await generateManualTripDetails({
-        tripId: createdTrip._id,
-        prompt: aiPrompt,
-        clerkUserId,
-        email,
-      });
-
-      navigation.navigate("PlanTrip", { trip: detailedTrip || createdTrip });
+      navigation.navigate("PlanTrip", { trip: createdTrip });
     } catch (err: any) {
       setError(err?.response?.data?.error || "Failed to create trip");
     } finally {

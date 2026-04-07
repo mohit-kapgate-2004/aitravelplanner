@@ -73,6 +73,22 @@ const haversineKm = (a, b) => {
   return R * c;
 };
 
+const buildOsmAddress = (tags = {}) => {
+  if (!tags || typeof tags !== 'object') return '';
+  if (tags['addr:full']) return tags['addr:full'];
+  const parts = [
+    tags['addr:housenumber'],
+    tags['addr:street'],
+    tags['addr:suburb'],
+    tags['addr:city'],
+    tags['addr:district'],
+    tags['addr:state'],
+    tags['addr:postcode'],
+    tags['addr:country'],
+  ].filter(Boolean);
+  return parts.join(', ');
+};
+
 const orderByNearestNeighbor = (activities) => {
   if (activities.length <= 2) return activities;
   const remaining = activities.slice(1);
@@ -556,20 +572,43 @@ const buildFallbackTravelModes = async (origin, destination) => {
     [origin.lat, origin.lng],
     [destination.lat, destination.lng],
   ];
+  const drivingResult = await fetchRouteForPoints(points, 'driving');
+  const drivingDistance = Number(drivingResult.summary?.distance || 0);
+  const drivingDuration = Number(drivingResult.summary?.duration || 0);
   const modes = [
     { id: 'driving', label: 'Car', profile: 'driving' },
     { id: 'cycling', label: 'Bike', profile: 'cycling' },
     { id: 'walking', label: 'Walk', profile: 'walking' },
   ];
+  const speedByProfile = {
+    driving: 38,
+    cycling: 14,
+    walking: 5,
+  };
 
   const settled = await Promise.allSettled(
     modes.map(async (mode) => {
-      const result = await fetchRouteForPoints(points, mode.profile);
+      const result =
+        mode.profile === 'driving'
+          ? drivingResult
+          : await fetchRouteForPoints(points, mode.profile);
+      let distanceMeters = Number(result.summary?.distance || 0);
+      if (!distanceMeters && drivingDistance) {
+        distanceMeters = drivingDistance;
+      }
+      let durationSeconds = Number(result.summary?.duration || 0);
+      if (distanceMeters > 0 && mode.profile !== 'driving') {
+        const speed = speedByProfile[mode.profile] || speedByProfile.driving;
+        durationSeconds = Math.max(
+          60,
+          Math.round((distanceMeters / 1000 / speed) * 3600)
+        );
+      }
       return {
         id: mode.id,
         label: mode.label,
-        distance: Number(result.summary?.distance || 0),
-        duration: Number(result.summary?.duration || 0),
+        distance: distanceMeters,
+        duration: durationSeconds,
         provider: result.fallback ? 'estimated' : 'osrm',
         available: true,
         note: result.fallback
@@ -583,20 +622,56 @@ const buildFallbackTravelModes = async (origin, destination) => {
     .filter((item) => item.status === 'fulfilled')
     .map((item) => item.value);
 
-  values.splice(1, 0, {
-    id: 'transit',
-    label: 'Transit',
-    distance: null,
-    duration: null,
-    provider: 'unavailable',
-    available: false,
-    note:
-      TRAVELTIME_APP_ID && TRAVELTIME_API_KEY
-        ? 'Transit timing is temporarily unavailable.'
-        : GOOGLE_MAPS_API_KEY
-        ? 'Transit timing is temporarily unavailable.'
-        : 'Add TravelTime or Google Maps credentials to show live public transit timings.',
-  });
+  if (drivingDistance > 0) {
+    const transitDistance = Math.round(drivingDistance * 1.05);
+    const transitDuration = Math.max(
+      60,
+      Math.round((drivingDuration || (transitDistance / 1000 / 22) * 3600) * 1.3)
+    );
+    values.splice(1, 0, {
+      id: 'transit',
+      label: 'Transit',
+      distance: transitDistance,
+      duration: transitDuration,
+      provider: 'estimated',
+      available: true,
+      note: 'Estimated public transport timing.',
+    });
+  } else {
+    values.splice(1, 0, {
+      id: 'transit',
+      label: 'Transit',
+      distance: null,
+      duration: null,
+      provider: 'unavailable',
+      available: false,
+      note:
+        TRAVELTIME_APP_ID && TRAVELTIME_API_KEY
+          ? 'Transit timing is temporarily unavailable.'
+          : GOOGLE_MAPS_API_KEY
+          ? 'Transit timing is temporarily unavailable.'
+          : 'Add TravelTime or Google Maps credentials to show live public transit timings.',
+    });
+  }
+
+  if (drivingDistance > 0) {
+    values.forEach((mode) => {
+      if (mode.id === 'cycling' && Math.abs(mode.distance - drivingDistance) < drivingDistance * 0.02) {
+        mode.distance = Math.round(drivingDistance * 1.05);
+        mode.duration = Math.max(
+          60,
+          Math.round((mode.distance / 1000 / speedByProfile.cycling) * 3600)
+        );
+      }
+      if (mode.id === 'walking' && Math.abs(mode.distance - drivingDistance) < drivingDistance * 0.02) {
+        mode.distance = Math.round(drivingDistance * 1.1);
+        mode.duration = Math.max(
+          60,
+          Math.round((mode.distance / 1000 / speedByProfile.walking) * 3600)
+        );
+      }
+    });
+  }
 
   return values;
 };
@@ -681,6 +756,40 @@ const fetchTravelModes = async (origin, destination) => {
       modes: await buildFallbackTravelModes(origin, destination),
       source: 'fallback',
     };
+  }
+
+  const fallbackModes = await buildFallbackTravelModes(origin, destination);
+  const fallbackById = new Map(
+    fallbackModes.map((mode) => [mode.id, mode])
+  );
+  const normalizedModes = (payload.modes || []).map((mode) => {
+    const fallback =
+      fallbackById.get(mode.id) ||
+      (mode.id === 'bicycling' ? fallbackById.get('cycling') : null);
+    const distance = Number(mode.distance || 0);
+    const duration = Number(mode.duration || 0);
+    if (
+      fallback &&
+      (!Number.isFinite(distance) || distance <= 0 || !Number.isFinite(duration) || duration <= 0)
+    ) {
+      return { ...fallback, ...mode, distance: fallback.distance, duration: fallback.duration };
+    }
+    return { ...fallback, ...mode, id: fallback?.id || mode.id };
+  });
+
+  const nonTransitModes = normalizedModes.filter((mode) => mode.id !== 'transit');
+  const timeSignature = nonTransitModes
+    .map((mode) => `${Math.round(Number(mode.duration || 0))}:${Math.round(Number(mode.distance || 0))}`)
+    .filter(Boolean);
+  const allSame =
+    timeSignature.length > 1 && timeSignature.every((value) => value === timeSignature[0]);
+  if (allSame) {
+    const transit = normalizedModes.find((mode) => mode.id === 'transit');
+    payload.modes = fallbackModes.map((mode) =>
+      mode.id === 'transit' && transit ? transit : mode
+    );
+  } else {
+    payload.modes = normalizedModes;
   }
 
   travelModesCache.set(cacheKey, { payload, cachedAt: now });
@@ -944,6 +1053,8 @@ out center 30;
       .map((el) => ({
         id: String(el.id),
         name: el.tags?.name || 'Unnamed place',
+        address: buildOsmAddress(el.tags),
+        category: type,
         lat: el.lat || el.center?.lat,
         lng: el.lon || el.center?.lon,
       }))

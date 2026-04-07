@@ -5,6 +5,20 @@ import User from "../models/user.js";
 
 const router = express.Router();
 
+const MIN_BUDGET_PER_PERSON_PER_DAY = Number(
+  process.env.MIN_BUDGET_PER_PERSON_PER_DAY || 1200
+);
+
+function estimateMinimumBudget(days, travelers) {
+  const safeDays = Math.max(1, Number(days) || 1);
+  const safeTravelers = Math.max(1, Number(travelers) || 1);
+  return Math.round(MIN_BUDGET_PER_PERSON_PER_DAY * safeDays * safeTravelers);
+}
+
+function buildLowBudgetReply({ budget, minBudget, days, travelers }) {
+  return `Your budget (${budget} INR) looks too low for a ${days}-day trip for ${travelers} traveler(s). A practical minimum is around ${minBudget} INR. Please increase the budget so I can plan stays, meals, and transport comfortably.`;
+}
+
 function extractFirstJsonObject(text) {
   if (!text) return null;
   let depth = 0;
@@ -240,7 +254,75 @@ function getPlaceImage(name = "", city = "") {
   return `https://source.unsplash.com/featured/?${encodeURIComponent(query)}`;
 }
 
+const AI_TIMEOUT_MS = Number(process.env.AI_TIMEOUT_MS || 12000);
 const NOMINATIM_TIMEOUT_MS = Number(process.env.NOMINATIM_TIMEOUT_MS || 9000);
+const NOMINATIM_CACHE_TTL_MS = Number(
+  process.env.NOMINATIM_CACHE_TTL_MS || 6 * 60 * 60 * 1000
+);
+const GEO_CACHE_TTL_MS = Number(process.env.GEO_CACHE_TTL_MS || 6 * 60 * 60 * 1000);
+const DESTINATION_CACHE_TTL_MS = Number(
+  process.env.DESTINATION_CACHE_TTL_MS || 6 * 60 * 60 * 1000
+);
+const REVERSE_CACHE_TTL_MS = Number(
+  process.env.REVERSE_CACHE_TTL_MS || 6 * 60 * 60 * 1000
+);
+const EXTRA_PLACES_CACHE_TTL_MS = Number(
+  process.env.EXTRA_PLACES_CACHE_TTL_MS || 3 * 60 * 60 * 1000
+);
+const GEOCODE_CONCURRENCY = Number(process.env.GEOCODE_CONCURRENCY || 5);
+
+const nominatimSearchCache = new Map();
+const geocodePlaceCache = new Map();
+const destinationContextCache = new Map();
+const reverseGeocodeCache = new Map();
+const extraPlacesCache = new Map();
+
+const cacheGet = (cache, key) => {
+  const entry = cache.get(key);
+  if (!entry) return { hit: false };
+  if (Date.now() > entry.expiresAt) {
+    cache.delete(key);
+    return { hit: false };
+  }
+  return { hit: true, value: entry.value };
+};
+
+const cacheSet = (cache, key, value, ttlMs) => {
+  cache.set(key, { value, expiresAt: Date.now() + ttlMs });
+};
+
+const fetchWithTimeout = async (url, options = {}, timeoutMs = AI_TIMEOUT_MS) => {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(timeout);
+  }
+};
+
+const mapWithConcurrency = async (items, limit, mapper) => {
+  if (!items.length) return [];
+  const results = new Array(items.length);
+  let index = 0;
+  const workers = Array.from(
+    { length: Math.min(limit, items.length) },
+    () =>
+      (async () => {
+        while (true) {
+          const current = index++;
+          if (current >= items.length) break;
+          try {
+            results[current] = await mapper(items[current], current);
+          } catch (err) {
+            results[current] = null;
+          }
+        }
+      })()
+  );
+  await Promise.all(workers);
+  return results;
+};
 
 async function searchNominatim(query, options = {}) {
   const params = new URLSearchParams({
@@ -289,6 +371,17 @@ async function searchNominatim(query, options = {}) {
   }
 }
 
+async function cachedSearchNominatim(query, options = {}) {
+  const key = `${String(query).toLowerCase()}|${options.countryCode || ""}|${
+    options.limit || 6
+  }`;
+  const cached = cacheGet(nominatimSearchCache, key);
+  if (cached.hit) return cached.value || [];
+  const results = await searchNominatim(query, options);
+  cacheSet(nominatimSearchCache, key, results, NOMINATIM_CACHE_TTL_MS);
+  return results;
+}
+
 async function reverseGeocodeLocation(lat, lng) {
   const params = new URLSearchParams({
     format: "jsonv2",
@@ -301,16 +394,16 @@ async function reverseGeocodeLocation(lat, lng) {
   const timeout = setTimeout(() => controller.abort(), NOMINATIM_TIMEOUT_MS);
 
   try {
-    const response = await fetch(
+    const response = await fetchWithTimeout(
       `https://nominatim.openstreetmap.org/reverse?${params.toString()}`,
       {
-        signal: controller.signal,
         headers: {
           "User-Agent":
             process.env.NOMINATIM_USER_AGENT || "ai-travel-planner/1.0",
           Accept: "application/json",
         },
-      }
+      },
+      NOMINATIM_TIMEOUT_MS
     );
 
     if (!response.ok) return null;
@@ -329,6 +422,10 @@ async function getLocationContextFromCoordinates(userLocation = null) {
   const lat = Number(userLocation.lat);
   const lng = Number(userLocation.lng);
   if (!Number.isFinite(lat) || !Number.isFinite(lng)) return null;
+
+  const key = `${lat.toFixed(3)},${lng.toFixed(3)}`;
+  const cached = cacheGet(reverseGeocodeCache, key);
+  if (cached.hit) return cached.value;
 
   const reverse = await reverseGeocodeLocation(lat, lng);
   const address = reverse?.address || {};
@@ -353,19 +450,25 @@ async function getLocationContextFromCoordinates(userLocation = null) {
         .join(",")
         .trim();
 
-  return {
+  const context = {
     cityHint,
     center: { lat, lng },
     countryCode,
     countryName,
     maxRadiusKm: 180,
   };
+  cacheSet(reverseGeocodeCache, key, context, REVERSE_CACHE_TTL_MS);
+  return context;
 }
 
 async function getDestinationContext(cityHint = "") {
   if (!cityHint) return null;
 
-  const results = await searchNominatim(cityHint, { limit: 1 });
+  const cacheKey = String(cityHint).toLowerCase();
+  const cached = cacheGet(destinationContextCache, cacheKey);
+  if (cached.hit) return cached.value;
+
+  const results = await cachedSearchNominatim(cityHint, { limit: 1 });
   const best = results[0];
   if (!best) return null;
 
@@ -393,13 +496,15 @@ async function getDestinationContext(cityHint = "") {
     maxRadiusKm = Math.min(320, Math.max(35, Math.round(farthest * 2.5)));
   }
 
-  return {
+  const context = {
     cityHint,
     center: { lat, lng },
     countryCode: String(best?.address?.country_code || "").toLowerCase(),
     countryName: String(best?.address?.country || ""),
     maxRadiusKm,
   };
+  cacheSet(destinationContextCache, cacheKey, context, DESTINATION_CACHE_TTL_MS);
+  return context;
 }
 
 function isCandidateWithinDestination(candidate, destinationContext) {
@@ -575,6 +680,12 @@ function scheduleActivitiesByTime(activities = [], days = 1, startDateValue) {
 }
 
 async function geocodePlace(placeName, cityHint = "", destinationContext = null) {
+  const cacheKey = `${String(placeName).toLowerCase()}|${String(
+    cityHint || ""
+  ).toLowerCase()}|${destinationContext?.countryCode || ""}`;
+  const cached = cacheGet(geocodePlaceCache, cacheKey);
+  if (cached.hit) return cached.value;
+
   const queries = cityHint
     ? [`${placeName}, ${cityHint}`, `${placeName} ${cityHint}`, placeName]
     : [placeName];
@@ -583,14 +694,14 @@ async function geocodePlace(placeName, cityHint = "", destinationContext = null)
   let bestScore = Number.POSITIVE_INFINITY;
 
   for (const query of queries) {
-    const scopedResults = await searchNominatim(query, {
+    const scopedResults = await cachedSearchNominatim(query, {
       limit: 8,
       countryCode: destinationContext?.countryCode,
     });
     const fallbackResults =
       scopedResults.length > 0
         ? scopedResults
-        : await searchNominatim(query, { limit: 8 });
+        : await cachedSearchNominatim(query, { limit: 8 });
 
     for (const candidate of fallbackResults) {
       const score = scoreGeocodeCandidate(candidate, destinationContext, cityHint);
@@ -610,39 +721,48 @@ async function geocodePlace(placeName, cityHint = "", destinationContext = null)
     }
   }
 
-  if (!bestCandidate) return null;
+  if (!bestCandidate) {
+    cacheSet(geocodePlaceCache, cacheKey, null, GEO_CACHE_TTL_MS);
+    return null;
+  }
   if (
     destinationContext &&
     !isCandidateWithinDestination(bestCandidate, destinationContext)
   ) {
+    cacheSet(geocodePlaceCache, cacheKey, null, GEO_CACHE_TTL_MS);
     return null;
   }
+  cacheSet(geocodePlaceCache, cacheKey, bestCandidate, GEO_CACHE_TTL_MS);
   return bestCandidate;
 }
 
 async function buildActivitiesFromPlaces(places = [], cityHint = "", destinationContext = null) {
-  const activities = [];
   const seenNames = new Set();
-  for (const place of places) {
+  const uniquePlaces = (places || []).filter((place) => {
     const name = String(place?.name || "").trim();
+    if (!name) return false;
     const key = normalizeNameKey(name);
-    if (!name || seenNames.has(key)) continue;
+    if (seenNames.has(key)) return false;
     seenNames.add(key);
+    return true;
+  });
 
+  const tasks = await mapWithConcurrency(uniquePlaces, GEOCODE_CONCURRENCY, async (place) => {
+    const name = String(place?.name || "").trim();
     const geo = await geocodePlace(name, cityHint, destinationContext);
-    if (!geo) continue;
+    if (!geo) return null;
     if (
       destinationContext &&
       !isCandidateWithinDestination(geo, destinationContext)
     ) {
-      continue;
+      return null;
     }
 
     const lat = Number(geo.lat);
     const lon = Number(geo.lon);
-    if (!Number.isFinite(lat) || !Number.isFinite(lon)) continue;
+    if (!Number.isFinite(lat) || !Number.isFinite(lon)) return null;
 
-    activities.push({
+    return {
       name,
       briefDescription:
         place.briefDescription || `${name} in your destination.`,
@@ -651,7 +771,9 @@ async function buildActivitiesFromPlaces(places = [], cityHint = "", destination
         name,
         place.briefDescription || ""
       ),
-      photos: [getPlaceImage(name, cityHint || destinationContext?.cityHint || "")],
+      photos: [
+        getPlaceImage(name, cityHint || destinationContext?.cityHint || ""),
+      ],
       geometry: {
         location: {
           lat,
@@ -668,9 +790,10 @@ async function buildActivitiesFromPlaces(places = [], cityHint = "", destination
           },
         },
       },
-    });
-  }
-  return activities;
+    };
+  });
+
+  return tasks.filter(Boolean);
 }
 
 async function fetchNearbyAttractions(destinationContext, existingNames = [], needed = 0) {
@@ -707,11 +830,11 @@ out center 120;
     let elements = [];
 
     for (const endpoint of endpoints) {
-      const response = await fetch(endpoint, {
+      const response = await fetchWithTimeout(endpoint, {
         method: "POST",
         headers: { "Content-Type": "application/x-www-form-urlencoded" },
         body: `data=${encodeURIComponent(query)}`,
-      });
+      }, AI_TIMEOUT_MS);
 
       if (!response.ok) {
         if (response.status === 429) {
@@ -835,7 +958,14 @@ async function fetchExtraPlaces(
 ) {
   if (!city || needed <= 0) return [];
 
-  const extraRes = await fetch(
+  const cacheKey = `${String(city).toLowerCase()}|${existingNames
+    .map((name) => normalizeNameKey(name))
+    .sort()
+    .join(",")}|${needed}`;
+  const cached = cacheGet(extraPlacesCache, cacheKey);
+  if (cached.hit) return cached.value || [];
+
+  const extraRes = await fetchWithTimeout(
     "https://api.groq.com/openai/v1/chat/completions",
     {
       method: "POST",
@@ -875,7 +1005,8 @@ ${
           }
         ]
       })
-    }
+    },
+    AI_TIMEOUT_MS
   );
 
   const extraData = await extraRes.json();
@@ -891,7 +1022,9 @@ ${
   const parsed = safeJsonParse(jsonString);
   if (!parsed || !Array.isArray(parsed.places)) return [];
 
-  return normalizePlaces(parsed.places);
+  const normalized = normalizePlaces(parsed.places);
+  cacheSet(extraPlacesCache, cacheKey, normalized, EXTRA_PLACES_CACHE_TTL_MS);
+  return normalized;
 }
 
 router.post("/chat", async (req, res) => {
@@ -932,6 +1065,25 @@ router.post("/chat", async (req, res) => {
       const effectiveDays = requestedDays
         ? Math.max(1, Math.min(30, requestedDays))
         : Math.max(1, existingTrip.itinerary.length || 1);
+      const travelerCount =
+        requestedTravelers ||
+        existingTrip.manualPreferences?.travelersCount ||
+        (Array.isArray(existingTrip.travelers) && existingTrip.travelers.length) ||
+        1;
+
+      if (requestedBudget !== null) {
+        const minBudget = estimateMinimumBudget(effectiveDays, travelerCount);
+        if (requestedBudget < minBudget) {
+          return res.json({
+            reply: buildLowBudgetReply({
+              budget: requestedBudget,
+              minBudget,
+              days: effectiveDays,
+              travelers: travelerCount,
+            }),
+          });
+        }
+      }
       const baseCityHint = getTripDestinationHint(existingTrip);
       const cityHint =
         wantsNearbyPlan && userLocationContext?.cityHint
@@ -1198,20 +1350,39 @@ ${
       });
     }
 
-    const aiRes = await fetch(
-      "https://api.groq.com/openai/v1/chat/completions",
-      {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${process.env.GROQ_API_KEY}`,
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({
-          model: "llama-3.1-8b-instant",
-          messages: [
-            {
-              role: "system",
-              content: `
+    if (requestedBudget !== null) {
+      const plannedDays = requestedDays ? Math.max(1, Math.min(30, requestedDays)) : 3;
+      const travelerCount = requestedTravelers || 1;
+      const minBudget = estimateMinimumBudget(plannedDays, travelerCount);
+      if (requestedBudget < minBudget) {
+        return res.status(200).json({
+          reply: buildLowBudgetReply({
+            budget: requestedBudget,
+            minBudget,
+            days: plannedDays,
+            travelers: travelerCount,
+          }),
+        });
+      }
+    }
+
+    let plan;
+    let aiContent = "";
+    try {
+      const aiRes = await fetchWithTimeout(
+        "https://api.groq.com/openai/v1/chat/completions",
+        {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${process.env.GROQ_API_KEY}`,
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({
+            model: "llama-3.1-8b-instant",
+            messages: [
+              {
+                role: "system",
+                content: `
 You are an intelligent AI travel planner.
 You must understand user constraints and travel style.
 
@@ -1266,46 +1437,45 @@ ${
 }
 - In "reply", do not include extra suggestions unless the user explicitly asked for recommendations.
 `
-            },
-            { role: "user", content: message }
-          ]
-        })
+              },
+              { role: "user", content: message }
+            ]
+          })
+        },
+        AI_TIMEOUT_MS
+      );
+
+      const aiData = await aiRes.json();
+      aiContent = aiData?.choices?.[0]?.message?.content || "";
+      let raw = aiContent
+        .replace(/```json/g, "")
+        .replace(/```/g, "")
+        .trim();
+
+      const jsonString = extractFirstJsonObject(raw);
+
+      if (!jsonString) {
+        throw new Error("AI did not return valid JSON");
       }
-    );
 
-    const aiData = await aiRes.json();
-    const aiContent = aiData?.choices?.[0]?.message?.content || "";
-    let raw = aiContent
-      .replace(/```json/g, "")
-      .replace(/```/g, "")
-      .trim();
-
-    const jsonString = extractFirstJsonObject(raw);
-
-    if (!jsonString) {
-      console.error("AI RAW RESPONSE:", raw);
-      return res.status(500).json({ error: "AI did not return valid JSON" });
-    }
-
-    let plan;
-    try {
-      plan = JSON.parse(jsonString);
-    } catch (e) {
       try {
+        plan = JSON.parse(jsonString);
+      } catch (e) {
         const safeJson = jsonString
           .replace(/(\w+):/g, '"$1":')
           .replace(/'/g, '"')
           .replace(/,\s*}/g, "}")
           .replace(/,\s*]/g, "]");
-
         plan = JSON.parse(safeJson);
-      } catch (e2) {
-        console.error("AI RAW RESPONSE:", raw);
-        console.error("SANITIZED JSON:", jsonString);
-        return res.status(500).json({
-          error: "AI returned invalid trip plan"
-        });
       }
+    } catch (err) {
+      plan = {
+        reply:
+          "I generated a quick plan using nearby attractions. You can refine it anytime.",
+        city: "",
+        days: requestedDays || 3,
+        places: []
+      };
     }
 
     const aiDays = Number(plan?.days);

@@ -14,6 +14,7 @@ import { useUser } from "@clerk/clerk-expo";
 import axios from "axios";
 import dayjs from "dayjs";
 import { API_BASE_URL } from "../config/api";
+import { safeGoBack } from "../utils/navigation";
 
 
 type FlowItem = {
@@ -278,11 +279,7 @@ const ItineraryFlowScreen = () => {
       : flow.filter((item) => item.day === selectedDay);
 
   const goBackSafe = () => {
-    if (navigation?.canGoBack?.()) {
-      navigation.goBack();
-      return;
-    }
-    navigation.navigate("Guides", { screen: "GuideMain" });
+    safeGoBack(navigation);
   };
 
   return (

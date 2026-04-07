@@ -15,6 +15,7 @@ import { Ionicons } from "@expo/vector-icons";
 import { useUser } from "@clerk/clerk-expo";
 import * as Location from "expo-location";
 import { API_BASE_URL } from "../config/api";
+import { safeGoBack } from "../utils/navigation";
 
 type Message = {
   role: "user" | "assistant";
@@ -65,11 +66,7 @@ const AIChatScreen = ({ navigation, route }: any) => {
   }, [messages]);
 
   const goBackSafe = () => {
-    if (navigation?.canGoBack?.()) {
-      navigation.goBack();
-      return;
-    }
-    navigation.navigate("Home", { screen: "HomeMain" });
+    safeGoBack(navigation);
   };
 
   const needsCurrentLocation = (text: string) =>
